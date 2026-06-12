@@ -136,6 +136,7 @@ class DataManager:
                 category_id INTEGER REFERENCES categories(id),
                 description TEXT,
                 amount      REAL NOT NULL,
+                recurring   INTEGER DEFAULT 0,
                 created_at  TEXT DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_exp_date ON expenses(date);
@@ -154,6 +155,11 @@ class DataManager:
     def _maybe_migrate(self):
         count = self._conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
         if count > 0:
+            # Migrar columna recurring si no existe (BDs anteriores a esta versión)
+            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(expenses)").fetchall()]
+            if "recurring" not in cols:
+                self._conn.execute("ALTER TABLE expenses ADD COLUMN recurring INTEGER DEFAULT 0")
+                self._conn.commit()
             return
         if os.path.exists(DATA_FILE):
             self._migrate_from_json()
@@ -264,13 +270,13 @@ class DataManager:
     # ── expenses ──────────────────────────────────────────────────────────────
     def _query_expenses(self, where: str, params: tuple):
         sql = (
-            "SELECT e.id, e.date, c.name AS category, e.description, e.amount "
+            "SELECT e.id, e.date, c.name AS category, e.description, e.amount, e.recurring "
             "FROM expenses e JOIN categories c ON c.id = e.category_id "
             "WHERE " + where + " ORDER BY e.date DESC, e.id DESC"
         )
         return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
-    def add_expense(self, date: str, category: str, description: str, amount: float):
+    def add_expense(self, date: str, category: str, description: str, amount: float, recurring: int = 0):
         row = self._conn.execute(
             "SELECT id FROM categories WHERE name=?", (category,)
         ).fetchone()
@@ -280,12 +286,12 @@ class DataManager:
                 "SELECT id FROM categories WHERE name=?", (category,)
             ).fetchone()
         self._conn.execute(
-            "INSERT INTO expenses(date, category_id, description, amount) VALUES(?,?,?,?)",
-            (date, row[0], description, amount)
+            "INSERT INTO expenses(date, category_id, description, amount, recurring) VALUES(?,?,?,?,?)",
+            (date, row[0], description, amount, recurring)
         )
         self._conn.commit()
 
-    def update_expense(self, expense_id: int, date: str, category: str, description: str, amount: float):
+    def update_expense(self, expense_id: int, date: str, category: str, description: str, amount: float, recurring: int = 0):
         """Actualiza un gasto existente por su id."""
         row = self._conn.execute(
             "SELECT id FROM categories WHERE name=?", (category,)
@@ -296,8 +302,8 @@ class DataManager:
                 "SELECT id FROM categories WHERE name=?", (category,)
             ).fetchone()
         self._conn.execute(
-            "UPDATE expenses SET date=?, category_id=?, description=?, amount=? WHERE id=?",
-            (date, row[0], description, amount, expense_id)
+            "UPDATE expenses SET date=?, category_id=?, description=?, amount=?, recurring=? WHERE id=?",
+            (date, row[0], description, amount, recurring, expense_id)
         )
         self._conn.commit()
 
@@ -307,6 +313,10 @@ class DataManager:
 
     def expenses_for_month(self, year_month: str):
         return self._query_expenses("e.date LIKE ?", (year_month + "%",))
+
+    def recurring_expenses_for_month(self, year_month: str):
+        """Devuelve solo los gastos marcados como recurrentes en el mes indicado."""
+        return [e for e in self.expenses_for_month(year_month) if e.get("recurring")]
 
     def expenses_for_year(self, year: str):
         return self._query_expenses("e.date LIKE ?", (year + "%",))
@@ -605,6 +615,8 @@ class EconoHogar(tk.Tk):
         now = datetime.date.today()
         self.active_year  = tk.IntVar(value=now.year)
         self.active_month = tk.IntVar(value=now.month)
+        # Mes anterior para detectar cambio y proponer recurrentes
+        self._prev_ym = f"{now.year:04d}-{now.month:02d}"
 
         self._build_ui()
         self.refresh_all()
@@ -637,7 +649,7 @@ class EconoHogar(tk.Tk):
             y -= 1
         self.active_month.set(m)
         self.active_year.set(y)
-        self.refresh_all()
+        self._on_month_change()
 
     def _shortcut_next_month(self, event=None):
         if self._is_text_widget():
@@ -650,7 +662,73 @@ class EconoHogar(tk.Tk):
             y += 1
         self.active_month.set(m)
         self.active_year.set(y)
+        self._on_month_change()
+
+    # ── Cambio de mes con detección de recurrentes ─────────────────────────────
+    def _on_month_change(self):
+        """Llama a refresh_all y, si cambió el mes, propone copiar recurrentes."""
+        new_ym  = f"{self.active_year.get():04d}-{self.active_month.get():02d}"
+        prev_ym = self._prev_ym
+        if prev_ym and prev_ym != new_ym:
+            recurrentes = self.dm.recurring_expenses_for_month(prev_ym)
+            if recurrentes:
+                self._offer_recurring(recurrentes, new_ym)
+        self._prev_ym = new_ym
         self.refresh_all()
+
+    def _offer_recurring(self, recurrentes: list, new_ym: str):
+        """Ofrece copiar gastos recurrentes del mes anterior al mes nuevo."""
+        # Solo proponer los que no existen ya en el mes nuevo (misma cat + descripción)
+        existentes = self.dm.expenses_for_month(new_ym)
+        existentes_keys = {(e["category"], e["description"]) for e in existentes}
+        pendientes = [e for e in recurrentes
+                      if (e["category"], e["description"]) not in existentes_keys]
+        if not pendientes:
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Gastos recurrentes")
+        dialog.configure(bg=BG_DARK)
+        dialog.transient(self)
+
+        tk.Label(dialog, text="Tienes gastos recurrentes del mes anterior.\n¿Cuáles quieres añadir?",
+                 bg=BG_DARK, fg=TEXT_WHITE, font=("Segoe UI", 11), justify="left").pack(padx=20, pady=(16, 8))
+
+        vars_checks = []
+        for e in pendientes:
+            var = tk.BooleanVar(master=dialog, value=True)
+            texto = f"  {e['category']} — {e['description']}  ({e['amount']:.2f} €)"
+            ttk.Checkbutton(dialog, text=texto, variable=var).pack(anchor="w", padx=20, pady=2)
+            vars_checks.append((var, e))
+
+        def _aceptar():
+            import calendar
+            # Usar el último día del mes si el día original no existe en el mes nuevo
+            year, month = int(new_ym[:4]), int(new_ym[5:7])
+            last_day = calendar.monthrange(year, month)[1]
+            for var, e in vars_checks:
+                if var.get():
+                    orig_day = int(e["date"][8:10])
+                    day = min(orig_day, last_day)
+                    new_date = f"{new_ym}-{day:02d}"
+                    self.dm.add_expense(new_date, e["category"], e["description"],
+                                        e["amount"], recurring=1)
+            dialog.destroy()
+            self.refresh_all()
+
+        def _cancelar():
+            dialog.destroy()
+
+        btn_frame = tk.Frame(dialog, bg=BG_DARK)
+        btn_frame.pack(pady=16)
+        tk.Button(btn_frame, text="Añadir seleccionados", command=_aceptar,
+                  bg=ACCENT, fg="white", relief="flat", padx=12, pady=6).pack(side="left", padx=8)
+        tk.Button(btn_frame, text="Omitir", command=_cancelar,
+                  bg=BG_CARD, fg=TEXT_MUTED, relief="flat", padx=12, pady=6).pack(side="left", padx=8)
+
+        dialog.wait_visibility()
+        dialog.grab_set()
+        dialog.wait_window()
 
     # ── Layout principal ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -719,7 +797,7 @@ class EconoHogar(tk.Tk):
         tk.Spinbox(row_y, from_=2020, to=2040, textvariable=self.active_year,
                    width=6, bg=BG_CARD, fg=TEXT_WHITE, buttonbackground=BG_CARD,
                    relief="flat", font=("Segoe UI", 10),
-                   command=self.refresh_all).pack(side="right")
+                   command=self._on_month_change).pack(side="right")
 
         row_m = tk.Frame(nav, bg=BG_CARD2)
         row_m.pack(fill="x", pady=2)
@@ -727,7 +805,7 @@ class EconoHogar(tk.Tk):
         tk.Spinbox(row_m, from_=1, to=12, textvariable=self.active_month,
                    width=4, bg=BG_CARD, fg=TEXT_WHITE, buttonbackground=BG_CARD,
                    relief="flat", font=("Segoe UI", 10),
-                   command=self.refresh_all).pack(side="right")
+                   command=self._on_month_change).pack(side="right")
 
         ttk.Separator(self.sidebar, orient="horizontal").pack(fill="x", padx=16, pady=12)
 
@@ -860,14 +938,35 @@ class EconoHogar(tk.Tk):
                                     font=("Segoe UI", 11), width=10)
         self.exp_amount.grid(row=2, column=3, padx=(0, 12), ipady=5)
 
+        # Checkbox recurrente
+        self.exp_rec_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form_card, text="🔁 Recurrente",
+                        variable=self.exp_rec_var).grid(row=2, column=4, padx=(0, 8))
+
         styled_button(form_card, "➕ Añadir", self._add_expense,
-                      color=ACCENT).grid(row=2, column=4, padx=4)
+                      color=ACCENT).grid(row=2, column=5, padx=4)
 
         # Lista gastos
         list_hdr = tk.Frame(tab, bg=BG_DARK)
         list_hdr.pack(fill="x", padx=16, pady=(4, 2))
         self.expenses_month_label = label(list_hdr, "Gastos del mes", 12, bold=True)
         self.expenses_month_label.pack(side="left")
+
+        # Campo de búsqueda (a la derecha, antes del filtro de categoría)
+        search_wrap = tk.Frame(list_hdr, bg=BG_DARK)
+        search_wrap.pack(side="right", padx=(0, 12))
+        label(search_wrap, "🔍", 11).pack(side="left", padx=(0, 4))
+        self.search_var = tk.StringVar()
+        search_entry = tk.Entry(search_wrap, textvariable=self.search_var,
+                                bg=BG_CARD2, fg=TEXT_WHITE, insertbackground=TEXT_WHITE,
+                                relief="flat", font=("Segoe UI", 10), width=20)
+        search_entry.pack(side="left", ipady=3)
+        tk.Button(search_wrap, text="✕", bg=BG_DARK, fg=TEXT_MUTED,
+                  relief="flat", font=("Segoe UI", 9), cursor="hand2",
+                  activebackground=BG_DARK, activeforeground=ACCENT, bd=0,
+                  command=lambda: (self.search_var.set(""), self._refresh_expenses())
+                  ).pack(side="left", padx=(2, 0))
+        self.search_var.trace_add("write", lambda *_: self._refresh_expenses())
 
         # Filtro por categoría
         filter_wrap = tk.Frame(list_hdr, bg=BG_DARK)
@@ -1030,15 +1129,29 @@ class EconoHogar(tk.Tk):
         except ValueError:
             messagebox.showerror("Error", "Importe inválido. Usa números (ej: 12.50).")
             return
-        self.dm.add_expense(date, cat, desc, amount)
+        self.dm.add_expense(date, cat, desc, amount, recurring=int(self.exp_rec_var.get()))
         self.exp_desc.delete(0, "end")
         self.exp_amount.delete(0, "end")
+        self.exp_rec_var.set(False)
         self.refresh_all()
 
     def _delete_expense(self):
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("Aviso", "Selecciona un gasto para eliminar.")
+            return
+        # Obtener descripción e importe para mostrarlos en la confirmación
+        vals = self.tree.item(sel[0])["values"]
+        descripcion = vals[2]
+        importe = vals[3]
+        confirmado = messagebox.askyesno(
+            "Confirmar eliminación",
+            f"¿Seguro que quieres eliminar este gasto?\n\n"
+            f"Descripción: {descripcion}\n"
+            f"Importe: {importe}",
+            parent=self
+        )
+        if not confirmado:
             return
         self.dm.delete_expense(int(sel[0]))
         self.refresh_all()
@@ -1062,6 +1175,11 @@ class EconoHogar(tk.Tk):
         current_cat   = vals[1]
         current_desc  = vals[2]
         current_amount = str(vals[3]).replace(" €", "").strip()
+        # Recuperar el flag recurring de la BD (no está en el Treeview)
+        rec_row = self.dm._conn.execute(
+            "SELECT recurring FROM expenses WHERE id=?", (expense_id,)
+        ).fetchone()
+        current_recurring = bool(rec_row[0]) if rec_row else False
 
         # ── Ventana modal ──────────────────────────────────────────────────────
         dialog = tk.Toplevel(self)
@@ -1070,12 +1188,7 @@ class EconoHogar(tk.Tk):
         dialog.resizable(False, False)
         dialog.transient(self)
 
-        # Centrar sobre la ventana principal
-        dialog.update_idletasks()
-        px, py = self.winfo_x(), self.winfo_y()
-        pw, ph = self.winfo_width(), self.winfo_height()
-        dw, dh = 440, 320
-        dialog.geometry(f"{dw}x{dh}+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
+        dialog.withdraw()  # ocultar mientras se construye para evitar parpadeo
 
         # ── Contenedor interior ────────────────────────────────────────────────
         inner = tk.Frame(dialog, bg=BG_CARD, padx=24, pady=20)
@@ -1131,7 +1244,12 @@ class EconoHogar(tk.Tk):
                                 bg=BG_CARD2, fg=TEXT_WHITE,
                                 insertbackground=TEXT_WHITE, relief="flat",
                                 font=("Segoe UI", 11), width=14)
-        amount_entry.grid(row=6, column=0, sticky="w", ipady=5, pady=(0, 16), padx=(0, 12))
+        amount_entry.grid(row=6, column=0, sticky="w", ipady=5, pady=(0, 10), padx=(0, 12))
+
+        # Checkbox recurrente
+        rec_var = tk.BooleanVar(master=dialog, value=current_recurring)
+        ttk.Checkbutton(inner, text="🔁 Recurrente",
+                        variable=rec_var).grid(row=6, column=1, sticky="w", pady=(0, 10))
 
         # ── Botones ────────────────────────────────────────────────────────────
         def _guardar():
@@ -1158,7 +1276,8 @@ class EconoHogar(tk.Tk):
                                      parent=dialog)
                 return
 
-            self.dm.update_expense(expense_id, new_date, new_cat, new_desc, amount_f)
+            self.dm.update_expense(expense_id, new_date, new_cat, new_desc, amount_f,
+                                   recurring=int(rec_var.get()))
             dialog.destroy()
             self.refresh_all()
 
@@ -1169,6 +1288,15 @@ class EconoHogar(tk.Tk):
                       color=SUCCESS, font_size=10, pady=6).pack(side="left", padx=(0, 8))
         styled_button(btn_frame, "Cancelar", dialog.destroy,
                       color=BG_CARD2, font_size=10, pady=6).pack(side="left")
+
+        # Centrar sobre la ventana principal con tamaño real (después de construir el contenido)
+        dialog.update_idletasks()
+        dw = dialog.winfo_reqwidth()
+        dh = dialog.winfo_reqheight()
+        px, py = self.winfo_x(), self.winfo_y()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        dialog.geometry(f"+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
+        dialog.deiconify()
 
         # wait_visibility garantiza que la ventana está mapeada antes de grab_set;
         # sin esto grab_set lanza TclError en algunos window managers de Ubuntu.
@@ -1394,9 +1522,16 @@ class EconoHogar(tk.Tk):
         expenses = self.dm.expenses_for_month(ym)
         cat_filter = self.filter_cat_var.get() if hasattr(self, "filter_cat_var") else "Todas"
         visible = expenses if cat_filter == "Todas" else [e for e in expenses if e["category"] == cat_filter]
+        # Filtro por texto (descripción o categoría, case-insensitive)
+        texto = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
+        if texto:
+            visible = [e for e in visible
+                       if texto in e["description"].lower() or texto in e["category"].lower()]
         for e in sorted(visible, key=lambda e: e["date"], reverse=True):
+            # Prefijo visual para gastos recurrentes
+            desc = ("🔁 " if e.get("recurring") else "") + e["description"]
             self.tree.insert("", "end", iid=str(e["id"]), values=(
-                e["date"], e["category"], e["description"], f"{e['amount']:.2f} €"
+                e["date"], e["category"], desc, f"{e['amount']:.2f} €"
             ))
         mn = self._month_name(self.active_month.get())
         total_all = sum(e["amount"] for e in expenses)

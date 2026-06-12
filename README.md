@@ -107,8 +107,6 @@ chmod +x ~/Desktop/econohogar.desktop
 econohogar/
 ├── main.py              # Lanzador: comprueba dependencias y arranca gastos.py
 ├── gastos.py            # Aplicación completa (UI + lógica + datos)
-├── migrate_econohogar.py # Migración de datos desde versiones anteriores (JSON → SQLite)
-├── econohogar.desktop   # Acceso directo para el escritorio de Ubuntu
 └── ~/.econohogar.db     # Base de datos SQLite (generada automáticamente)
 ```
 
