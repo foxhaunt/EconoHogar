@@ -1,0 +1,10 @@
+# Ignorar todo por defecto
+*
+
+# Permitir únicamente estos archivos
+!main.py
+!gastos.py
+!README.md
+
+# Mantener el propio .gitignore
+!.gitignore
