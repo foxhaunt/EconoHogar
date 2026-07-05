@@ -5,6 +5,9 @@
 !main.py
 !gastos.py
 !README.md
+!constants.py
+!widgets.py
+
 
 # Mantener el propio .gitignore
 !.gitignore
