@@ -3,600 +3,26 @@
 EconoHogar - Control de Gastos y Economía Doméstica
 Aplicación de escritorio para Ubuntu
 """
-
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, colorchooser
-import json
-import os
-import sqlite3
-import shutil
 import datetime
 from collections import defaultdict
-import math
 
-# ── Intenta importar matplotlib; si falla, avisa ──────────────────────────────
+from constants import (BG_DARK, BG_CARD, BG_CARD2, ACCENT, ACCENT2,
+                       TEXT_WHITE, TEXT_MUTED, SUCCESS, WARNING, INFO,
+                       MATPLOTLIB_OK, CATEGORY_COLORS, CATEGORY_ICONS,
+                       DATA_FILE, DB_FILE)
+from data_manager import DataManager
+from widgets import (IconPicker, RoundedFrame, DatePicker, EditExpenseDialog,
+                     styled_button, label, _lighten)
+
 try:
-    import matplotlib
-    matplotlib.use("TkAgg")
-    import matplotlib.pyplot as plt
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
-    MATPLOTLIB_OK = True
 except ImportError:
-    MATPLOTLIB_OK = False
-
-# ── Paleta de colores ──────────────────────────────────────────────────────────
-BG_DARK      = "#1A1A2E"
-BG_CARD      = "#16213E"
-BG_CARD2     = "#0F3460"
-ACCENT       = "#E94560"
-ACCENT2      = "#533483"
-TEXT_WHITE   = "#EAEAEA"
-TEXT_MUTED   = "#8B8FA8"
-SUCCESS      = "#4CAF50"
-WARNING      = "#FF9800"
-INFO         = "#2196F3"
-
-CATEGORY_COLORS = [
-    "#FF6B6B","#4ECDC4","#45B7D1","#96CEB4","#FFEAA7",
-    "#DDA0DD","#98D8C8","#F7DC6F","#BB8FCE","#85C1E9",
-    "#F0B27A","#82E0AA","#F1948A","#85C1E9","#D7BDE2",
-]
-
-CATEGORY_ICONS = {
-    "Comida":       "🍽️",
-    "Luz":          "💡",
-    "Agua":         "💧",
-    "Gas":          "🔥",
-    "Internet":     "🌐",
-    "Teléfono":     "📱",
-    "Hipoteca":     "🏠",
-    "Alquiler":     "🏘️",
-    "Transporte":   "🚗",
-    "Salud":        "🏥",
-    "Educación":    "📚",
-    "Ocio":         "🎭",
-    "Ropa":         "👗",
-    "Gimnasio":     "💪",
-    "Seguros":      "🛡️",
-    "Hogar":        "🛋️",
-    "Mascotas":     "🐾",
-    "Viajes":       "✈️",
-    "Otros":        "📦",
-}
-
-ICON_EMOJIS = [
-    "🍽️","🍕","🍔","🥗","🍱","☕","🍺","🥤",
-    "🏠","🛋️","🪴","🔑","🛁","🧹","💡","🪟",
-    "🚗","🚌","🚲","✈️","⛽","🛵","🚇","🚕",
-    "💊","🏥","🩺","🏋️","🧘","❤️","🌡️","💆",
-    "📱","💻","🖥️","📺","🎮","🎧","📷","🔌",
-    "💰","💳","🏦","💸","📈","🪙","💎","🎫",
-    "📚","🎓","📝","✏️","📖","🔬","🎨","🖊️",
-    "🌿","🌊","🔥","💧","🌞","⚡","🌱","🐾",
-    "🛡️","🎭","👗","💪","🛒","🎁","📦","🧺",
-]
-
-DATA_FILE = os.path.join(os.path.expanduser("~"), ".econohogar_data.json")  # legacy JSON
-DB_FILE   = os.path.join(os.path.expanduser("~"), ".econohogar.db")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATOS
-# ══════════════════════════════════════════════════════════════════════════════
-class DataManager:
-    def __init__(self):
-        self._conn = sqlite3.connect(DB_FILE)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._init_schema()
-        self._maybe_migrate()
-        self._maybe_backup()
-
-    def _maybe_backup(self):
-        """Crea copia de la BD en HOME si no hay backup de los últimos 7 días."""
-        if not os.path.exists(DB_FILE):
-            return
-        home = os.path.expanduser("~")
-        today = datetime.date.today()
-        cutoff = today - datetime.timedelta(days=7)
-        # Buscar backups existentes más recientes que el umbral
-        for fname in os.listdir(home):
-            if not fname.startswith(".econohogar_backup_"):
-                continue
-            date_part = fname.replace(".econohogar_backup_", "").replace(".db", "")
-            try:
-                bdate = datetime.date.fromisoformat(date_part)
-                if bdate >= cutoff:
-                    return  # ya hay backup reciente, nada que hacer
-            except ValueError:
-                continue
-        # No hay backup reciente → crear uno
-        backup_path = os.path.join(home, f".econohogar_backup_{today}.db")
-        try:
-            dest = sqlite3.connect(backup_path)
-            self._conn.backup(dest)
-            dest.close()
-        except Exception:
-            pass  # el backup falla silenciosamente para no bloquear el arranque
-
-    def _init_schema(self):
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS categories (
-                id    INTEGER PRIMARY KEY,
-                name  TEXT NOT NULL UNIQUE,
-                icon  TEXT,
-                color TEXT
-            );
-            CREATE TABLE IF NOT EXISTS expenses (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                date        TEXT NOT NULL,
-                category_id INTEGER REFERENCES categories(id),
-                description TEXT,
-                amount      REAL NOT NULL,
-                recurring   INTEGER DEFAULT 0,
-                created_at  TEXT DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_exp_date ON expenses(date);
-            CREATE INDEX IF NOT EXISTS idx_exp_cat  ON expenses(category_id);
-            CREATE TABLE IF NOT EXISTS income (
-                id         INTEGER PRIMARY KEY,
-                year_month TEXT NOT NULL,
-                source     TEXT NOT NULL DEFAULT 'Salario',
-                amount     REAL NOT NULL,
-                note       TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_inc_month ON income(year_month);
-        """)
-        self._conn.commit()
-
-    def _maybe_migrate(self):
-        count = self._conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
-        if count > 0:
-            # Migrar columna recurring si no existe (BDs anteriores a esta versión)
-            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(expenses)").fetchall()]
-            if "recurring" not in cols:
-                self._conn.execute("ALTER TABLE expenses ADD COLUMN recurring INTEGER DEFAULT 0")
-                self._conn.commit()
-            return
-        if os.path.exists(DATA_FILE):
-            self._migrate_from_json()
-        else:
-            self._seed_defaults()
-
-    def _seed_defaults(self):
-        for name, icon in CATEGORY_ICONS.items():
-            self._conn.execute(
-                "INSERT OR IGNORE INTO categories(name, icon) VALUES(?,?)", (name, icon)
-            )
-        self._conn.commit()
-
-    def _migrate_from_json(self):
-        try:
-            shutil.copy2(DATA_FILE, DATA_FILE + ".bak")
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-        except Exception:
-            return
-
-        cat_map = {}
-        colors = d.get("category_colors", {})
-
-        for name in d.get("categories", []):
-            self._conn.execute(
-                "INSERT OR IGNORE INTO categories(name, icon, color) VALUES(?,?,?)",
-                (name, CATEGORY_ICONS.get(name), colors.get(name))
-            )
-            row = self._conn.execute(
-                "SELECT id FROM categories WHERE name=?", (name,)
-            ).fetchone()
-            cat_map[name] = row[0]
-
-        for e in d.get("expenses", []):
-            cat = e.get("category", "Otros")
-            if cat not in cat_map:
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO categories(name, icon, color) VALUES(?,?,?)",
-                    (cat, CATEGORY_ICONS.get(cat, "📦"), None)
-                )
-                row = self._conn.execute(
-                    "SELECT id FROM categories WHERE name=?", (cat,)
-                ).fetchone()
-                cat_map[cat] = row[0]
-            self._conn.execute(
-                "INSERT INTO expenses(date, category_id, description, amount) VALUES(?,?,?,?)",
-                (e["date"], cat_map[cat], e.get("description", ""), e.get("amount", 0.0))
-            )
-
-        for ym, amount in d.get("salaries", {}).items():
-            self._conn.execute(
-                "INSERT INTO income(year_month, source, amount) VALUES(?,?,?)",
-                (ym, "Salario", amount)
-            )
-
-        self._conn.commit()
-
-    def save(self):
-        pass  # SQLite escribe en transacciones; se mantiene por compatibilidad de API
-
-    # ── categories ────────────────────────────────────────────────────────────
-    @property
-    def categories(self):
-        return [r[0] for r in self._conn.execute(
-            "SELECT name FROM categories ORDER BY id"
-        ).fetchall()]
-
-    def add_category(self, name: str, color: str = None):
-        self._conn.execute(
-            "INSERT OR IGNORE INTO categories(name, icon, color) VALUES(?,?,?)",
-            (name, CATEGORY_ICONS.get(name), color)
-        )
-        self._conn.commit()
-
-    def remove_category(self, name: str):
-        self._conn.execute("DELETE FROM categories WHERE name=?", (name,))
-        self._conn.commit()
-
-    def rename_category(self, old_name: str, new_name: str):
-        self._conn.execute("UPDATE categories SET name=? WHERE name=?", (new_name, old_name))
-        self._conn.commit()
-
-    def set_category_color(self, name: str, color: str):
-        self._conn.execute("UPDATE categories SET color=? WHERE name=?", (color, name))
-        self._conn.commit()
-
-    def set_category_icon(self, name: str, icon: str):
-        self._conn.execute("UPDATE categories SET icon=? WHERE name=?", (icon, name))
-        self._conn.commit()
-
-    def category_color(self, cat: str) -> str:
-        row = self._conn.execute(
-            "SELECT color FROM categories WHERE name=?", (cat,)
-        ).fetchone()
-        if row and row[0]:
-            return row[0]
-        cats = self.categories
-        idx = cats.index(cat) if cat in cats else 0
-        return CATEGORY_COLORS[idx % len(CATEGORY_COLORS)]
-
-    def category_icon(self, cat: str) -> str:
-        row = self._conn.execute(
-            "SELECT icon FROM categories WHERE name=?", (cat,)
-        ).fetchone()
-        return (row[0] if row and row[0] else None) or CATEGORY_ICONS.get(cat, "📦")
-
-    # ── expenses ──────────────────────────────────────────────────────────────
-    def _query_expenses(self, where: str, params: tuple):
-        sql = (
-            "SELECT e.id, e.date, c.name AS category, e.description, e.amount, e.recurring "
-            "FROM expenses e JOIN categories c ON c.id = e.category_id "
-            "WHERE " + where + " ORDER BY e.date DESC, e.id DESC"
-        )
-        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
-
-    def add_expense(self, date: str, category: str, description: str, amount: float, recurring: int = 0):
-        row = self._conn.execute(
-            "SELECT id FROM categories WHERE name=?", (category,)
-        ).fetchone()
-        if row is None:
-            self.add_category(category)
-            row = self._conn.execute(
-                "SELECT id FROM categories WHERE name=?", (category,)
-            ).fetchone()
-        self._conn.execute(
-            "INSERT INTO expenses(date, category_id, description, amount, recurring) VALUES(?,?,?,?,?)",
-            (date, row[0], description, amount, recurring)
-        )
-        self._conn.commit()
-
-    def update_expense(self, expense_id: int, date: str, category: str, description: str, amount: float, recurring: int = 0):
-        """Actualiza un gasto existente por su id."""
-        row = self._conn.execute(
-            "SELECT id FROM categories WHERE name=?", (category,)
-        ).fetchone()
-        if row is None:
-            self.add_category(category)
-            row = self._conn.execute(
-                "SELECT id FROM categories WHERE name=?", (category,)
-            ).fetchone()
-        self._conn.execute(
-            "UPDATE expenses SET date=?, category_id=?, description=?, amount=?, recurring=? WHERE id=?",
-            (date, row[0], description, amount, recurring, expense_id)
-        )
-        self._conn.commit()
-
-    def delete_expense(self, expense_id: int):
-        self._conn.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
-        self._conn.commit()
-
-    def expenses_for_month(self, year_month: str):
-        return self._query_expenses("e.date LIKE ?", (year_month + "%",))
-
-    def recurring_expenses_for_month(self, year_month: str):
-        """Devuelve solo los gastos marcados como recurrentes en el mes indicado."""
-        return [e for e in self.expenses_for_month(year_month) if e.get("recurring")]
-
-    def expenses_for_year(self, year: str):
-        return self._query_expenses("e.date LIKE ?", (year + "%",))
-
-    def expenses_for_day(self, day: str):
-        return self._query_expenses("e.date = ?", (day,))
-
-    # ── income / salary ───────────────────────────────────────────────────────
-    def set_salary(self, year_month: str, amount: float):
-        self._conn.execute(
-            "DELETE FROM income WHERE year_month=? AND source='Salario'", (year_month,)
-        )
-        self._conn.execute(
-            "INSERT INTO income(year_month, source, amount) VALUES(?,?,?)",
-            (year_month, "Salario", amount)
-        )
-        self._conn.commit()
-
-    def get_salary(self, year_month: str) -> float:
-        row = self._conn.execute(
-            "SELECT SUM(amount) FROM income WHERE year_month=? AND source='Salario'",
-            (year_month,)
-        ).fetchone()
-        return row[0] or 0.0
-
-
-class IconPicker(tk.Toplevel):
-    """Diálogo modal para elegir un emoji como icono de categoría."""
-
-    COLS = 8
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.withdraw()
-        self.selected = None
-
-        self.title("Elige un icono")
-        self.configure(bg=BG_CARD)
-        self.resizable(False, False)
-        self.transient(parent)
-        self._build()
-
-        self.update_idletasks()
-        pw = parent.winfo_rootx() + parent.winfo_width() // 2 - self.winfo_reqwidth() // 2
-        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_reqheight() // 2
-        self.geometry(f"+{pw}+{ph}")
-        self.deiconify()
-
-        self.bind("<Escape>", lambda _: self.destroy())
-        self.wait_visibility()
-        self.grab_set()
-        self.focus_set()
-
-    def _build(self):
-        tk.Label(self, text="Elige un icono para la categoría",
-                 bg=BG_CARD, fg=TEXT_WHITE,
-                 font=("Segoe UI", 11, "bold"),
-                 pady=10, padx=12).pack(fill="x")
-
-        grid_f = tk.Frame(self, bg=BG_CARD, padx=10, pady=4)
-        grid_f.pack()
-
-        btn_cfg = dict(bg=BG_CARD2, activebackground=BG_DARK, relief="flat",
-                       bd=0, cursor="hand2", font=("Segoe UI", 16), width=2)
-        for i, emoji in enumerate(ICON_EMOJIS):
-            row, col = divmod(i, self.COLS)
-            b = tk.Button(grid_f, text=emoji,
-                          command=lambda e=emoji: self._pick(e),
-                          **btn_cfg)
-            b.grid(row=row, column=col, padx=3, pady=3)
-
-        sep = tk.Frame(self, bg=BG_CARD2, height=1)
-        sep.pack(fill="x", padx=10, pady=(6, 2))
-
-        custom_f = tk.Frame(self, bg=BG_CARD, padx=10, pady=8)
-        custom_f.pack(fill="x")
-        tk.Label(custom_f, text="O escribe tu emoji:", bg=BG_CARD,
-                 fg=TEXT_MUTED, font=("Segoe UI", 9)).pack(side="left")
-        self._custom_var = tk.StringVar()
-        entry = tk.Entry(custom_f, textvariable=self._custom_var,
-                         bg=BG_CARD2, fg=TEXT_WHITE, insertbackground=TEXT_WHITE,
-                         relief="flat", font=("Segoe UI", 14), width=4)
-        entry.pack(side="left", padx=8)
-        tk.Button(custom_f, text="Usar",
-                  command=self._use_custom,
-                  bg=ACCENT, fg="white", relief="flat",
-                  font=("Segoe UI", 9, "bold"),
-                  padx=8, pady=3, cursor="hand2").pack(side="left")
-
-    def _pick(self, emoji):
-        self.selected = emoji
-        self.destroy()
-
-    def _use_custom(self):
-        val = self._custom_var.get().strip()
-        if val:
-            self.selected = val
-            self.destroy()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# WIDGETS CUSTOM
-# ══════════════════════════════════════════════════════════════════════════════
-class RoundedFrame(tk.Canvas):
-    """Canvas que simula un frame con bordes redondeados."""
-    def __init__(self, parent, bg=BG_CARD, radius=16, **kwargs):
-        super().__init__(parent, bg=parent["bg"] if hasattr(parent,"__getitem__") else BG_DARK,
-                         highlightthickness=0, **kwargs)
-        self._bg = bg
-        self._radius = radius
-        self.bind("<Configure>", self._draw)
-
-    def _draw(self, event=None):
-        self.delete("bg")
-        w, h, r = self.winfo_width(), self.winfo_height(), self._radius
-        self._round_rect(2, 2, w-2, h-2, r, fill=self._bg, outline="", tags="bg")
-        self.tag_lower("bg")
-
-    def _round_rect(self, x1, y1, x2, y2, r, **kw):
-        pts = [
-            x1+r, y1,  x2-r, y1,
-            x2,   y1,  x2,   y1+r,
-            x2,   y2-r,x2,   y2,
-            x2-r, y2,  x1+r, y2,
-            x1,   y2,  x1,   y2-r,
-            x1,   y1+r,x1,   y1,
-            x1+r, y1,
-        ]
-        return self.create_polygon(pts, smooth=True, **kw)
-
-
-def styled_button(parent, text, command, color=ACCENT, fg=TEXT_WHITE, font_size=11, padx=18, pady=8):
-    btn = tk.Button(
-        parent, text=text, command=command,
-        bg=color, fg=fg, relief="flat", cursor="hand2",
-        font=("Segoe UI", font_size, "bold"),
-        activebackground=color, activeforeground=fg,
-        padx=padx, pady=pady
-    )
-    btn.bind("<Enter>", lambda e: btn.config(bg=_lighten(color)))
-    btn.bind("<Leave>", lambda e: btn.config(bg=color))
-    return btn
-
-
-def _lighten(hex_color: str, factor: float = 0.15) -> str:
-    hex_color = hex_color.lstrip("#")
-    r, g, b = (int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-    r = min(255, int(r + (255 - r) * factor))
-    g = min(255, int(g + (255 - g) * factor))
-    b = min(255, int(b + (255 - b) * factor))
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def label(parent, text, size=11, bold=False, color=TEXT_WHITE, **kw):
-    weight = "bold" if bold else "normal"
-    return tk.Label(parent, text=text, bg=parent["bg"],
-                    fg=color, font=("Segoe UI", size, weight), **kw)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SELECTOR DE FECHA (CALENDARIO DESPLEGABLE)
-# ══════════════════════════════════════════════════════════════════════════════
-import calendar as _calendar
-
-class DatePicker(tk.Toplevel):
-    """Calendario desplegable que rellena un Entry con la fecha ISO seleccionada."""
-
-    MESES = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-             "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
-
-    def __init__(self, parent, entry_widget):
-        super().__init__(parent)
-        self.withdraw()  # ocultar inmediatamente para evitar parpadeo en (0,0)
-        self._entry = entry_widget
-        try:
-            d = datetime.date.fromisoformat(entry_widget.get().strip())
-        except ValueError:
-            d = datetime.date.today()
-        self._year  = d.year
-        self._month = d.month
-
-        self.overrideredirect(True)
-        self.configure(bg=BG_CARD2,
-                       highlightbackground=ACCENT, highlightthickness=1)
-        self.transient(parent)
-        self._build()
-
-        # Posicionar justo bajo el entry y mostrar ya en la posición correcta
-        self.update_idletasks()
-        ex = entry_widget.winfo_rootx()
-        ey = entry_widget.winfo_rooty() + entry_widget.winfo_height() + 4
-        sw = self.winfo_screenwidth()
-        pw = self.winfo_reqwidth()
-        if ex + pw > sw:
-            ex = sw - pw - 4
-        self.geometry(f"+{ex}+{ey}")
-        self.deiconify()  # mostrar en la posición ya calculada
-
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.wait_visibility()
-        self.grab_set()
-        self.focus_set()
-
-    def _build(self):
-        for w in self.winfo_children():
-            w.destroy()
-
-        # Cabecera mes/año con flechas de navegación
-        hdr = tk.Frame(self, bg=BG_CARD2, padx=6, pady=6)
-        hdr.pack(fill="x")
-        nav_cfg = dict(bg=BG_CARD2, fg=TEXT_WHITE, relief="flat",
-                       font=("Segoe UI", 10, "bold"), cursor="hand2",
-                       activebackground=BG_DARK, activeforeground=TEXT_WHITE,
-                       bd=0, padx=10, pady=2)
-        tk.Button(hdr, text="◀", command=self._prev_month, **nav_cfg).pack(side="left")
-        tk.Label(hdr, text=f"{self.MESES[self._month]} {self._year}",
-                 bg=BG_CARD2, fg=TEXT_WHITE,
-                 font=("Segoe UI", 10, "bold"),
-                 width=17, anchor="center").pack(side="left", expand=True)
-        tk.Button(hdr, text="▶", command=self._next_month, **nav_cfg).pack(side="right")
-
-        # Nombres de los días de la semana
-        dias_f = tk.Frame(self, bg=BG_CARD2, padx=6)
-        dias_f.pack(fill="x")
-        for col, d in enumerate(["Lu", "Ma", "Mi", "Ju", "Vi", "Sá", "Do"]):
-            fg = ACCENT if col >= 5 else TEXT_MUTED
-            tk.Label(dias_f, text=d, bg=BG_CARD2, fg=fg,
-                     font=("Segoe UI", 8, "bold"),
-                     width=3, anchor="center").grid(row=0, column=col, padx=2, pady=(0, 2))
-
-        # Grid de días
-        grid_f = tk.Frame(self, bg=BG_CARD2, padx=6, pady=4)
-        grid_f.pack()
-        today = datetime.date.today()
-        try:
-            sel = datetime.date.fromisoformat(self._entry.get().strip())
-        except ValueError:
-            sel = None
-
-        for row_i, week in enumerate(_calendar.monthcalendar(self._year, self._month)):
-            for col_i, day in enumerate(week):
-                if day == 0:
-                    tk.Label(grid_f, text="", bg=BG_CARD2,
-                             width=3, height=1).grid(row=row_i, column=col_i,
-                                                     padx=2, pady=2)
-                    continue
-                d = datetime.date(self._year, self._month, day)
-                if d == sel:
-                    bg, fg = ACCENT, TEXT_WHITE
-                elif d == today:
-                    bg, fg = SUCCESS, TEXT_WHITE
-                else:
-                    bg = BG_DARK
-                    fg = ACCENT if col_i >= 5 else TEXT_WHITE
-                tk.Button(grid_f, text=str(day), bg=bg, fg=fg,
-                          relief="flat", font=("Segoe UI", 9),
-                          width=3, height=1, cursor="hand2",
-                          activebackground=ACCENT, activeforeground=TEXT_WHITE,
-                          bd=0,
-                          command=lambda dd=d: self._select(dd)
-                          ).grid(row=row_i, column=col_i, padx=2, pady=2)
-
-    def _prev_month(self):
-        self._month -= 1
-        if self._month < 1:
-            self._month = 12
-            self._year -= 1
-        self._build()
-
-    def _next_month(self):
-        self._month += 1
-        if self._month > 12:
-            self._month = 1
-            self._year += 1
-        self._build()
-
-    def _select(self, date: datetime.date):
-        self._entry.delete(0, "end")
-        self._entry.insert(0, date.isoformat())
-        self.destroy()
+    pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1157,152 +583,20 @@ class EconoHogar(tk.Tk):
         self.refresh_all()
 
     def _edit_expense(self, event=None):
-        """Abre un diálogo modal para editar el gasto seleccionado con doble clic."""
         # Fix timing: obtener la fila bajo el cursor directamente en lugar de
         # depender de selection(), que puede estar vacía cuando se dispara <Double-1>.
         if event:
             row_id = self.tree.identify_row(event.y)
             if not row_id:
-                return  # doble clic en zona vacía o encabezado
+                return
             self.tree.selection_set(row_id)
         sel = self.tree.selection()
         if not sel:
             return
-        expense_id = int(sel[0])
-        vals = self.tree.item(sel[0])["values"]
-        # vals = (fecha, categoría, descripción, importe_str)
-        current_date  = vals[0]
-        current_cat   = vals[1]
-        current_desc  = vals[2]
-        current_amount = str(vals[3]).replace(" €", "").strip()
-        # Recuperar el flag recurring de la BD (no está en el Treeview)
-        rec_row = self.dm._conn.execute(
-            "SELECT recurring FROM expenses WHERE id=?", (expense_id,)
-        ).fetchone()
-        current_recurring = bool(rec_row[0]) if rec_row else False
-
-        # ── Ventana modal ──────────────────────────────────────────────────────
-        dialog = tk.Toplevel(self)
-        dialog.title("✏️ Editar Gasto")
-        dialog.configure(bg=BG_DARK)
-        dialog.resizable(False, False)
-        dialog.transient(self)
-
-        dialog.withdraw()  # ocultar mientras se construye para evitar parpadeo
-
-        # ── Contenedor interior ────────────────────────────────────────────────
-        inner = tk.Frame(dialog, bg=BG_CARD, padx=24, pady=20)
-        inner.pack(fill="both", expand=True, padx=16, pady=16)
-
-        label(inner, "✏️  Editar Gasto", 14, bold=True).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 16))
-
-        # Fecha (entry + botón calendario)
-        label(inner, "Fecha", 10, color=TEXT_MUTED).grid(
-            row=1, column=0, sticky="w", pady=(0, 2))
-        date_var = tk.StringVar(master=dialog, value=current_date)
-        date_wrap = tk.Frame(inner, bg=BG_CARD)
-        date_wrap.grid(row=2, column=0, sticky="w", pady=(0, 10), padx=(0, 12))
-        date_entry = tk.Entry(date_wrap, textvariable=date_var,
-                              bg=BG_CARD2, fg=TEXT_WHITE,
-                              insertbackground=TEXT_WHITE, relief="flat",
-                              font=("Segoe UI", 11), width=13)
-        date_entry.pack(side="left", ipady=5)
-        tk.Button(date_wrap, text="📅", bg=BG_CARD2, fg=TEXT_WHITE,
-                  relief="flat", font=("Segoe UI", 10), cursor="hand2",
-                  activebackground=BG_CARD2, activeforeground=ACCENT,
-                  bd=0, padx=6, pady=5,
-                  command=lambda: DatePicker(dialog, date_entry)
-                  ).pack(side="left")
-
-        # Categoría
-        label(inner, "Categoría", 10, color=TEXT_MUTED).grid(
-            row=1, column=1, sticky="w", pady=(0, 2))
-        cat_var = tk.StringVar(master=dialog, value=current_cat)
-        cats = self.dm.categories
-        cat_cb = ttk.Combobox(inner, textvariable=cat_var, values=cats,
-                              width=18, font=("Segoe UI", 11), state="readonly")
-        if current_cat in cats:
-            cat_cb.current(cats.index(current_cat))
-        cat_cb.grid(row=2, column=1, sticky="w", ipady=4, pady=(0, 10))
-
-        # Descripción
-        label(inner, "Descripción", 10, color=TEXT_MUTED).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(0, 2))
-        desc_var = tk.StringVar(master=dialog, value=current_desc)
-        desc_entry = tk.Entry(inner, textvariable=desc_var,
-                              bg=BG_CARD2, fg=TEXT_WHITE,
-                              insertbackground=TEXT_WHITE, relief="flat",
-                              font=("Segoe UI", 11), width=38)
-        desc_entry.grid(row=4, column=0, columnspan=2, sticky="w", ipady=5, pady=(0, 10))
-
-        # Importe
-        label(inner, "Importe (€)", 10, color=TEXT_MUTED).grid(
-            row=5, column=0, sticky="w", pady=(0, 2))
-        amount_var = tk.StringVar(master=dialog, value=current_amount)
-        amount_entry = tk.Entry(inner, textvariable=amount_var,
-                                bg=BG_CARD2, fg=TEXT_WHITE,
-                                insertbackground=TEXT_WHITE, relief="flat",
-                                font=("Segoe UI", 11), width=14)
-        amount_entry.grid(row=6, column=0, sticky="w", ipady=5, pady=(0, 10), padx=(0, 12))
-
-        # Checkbox recurrente
-        rec_var = tk.BooleanVar(master=dialog, value=current_recurring)
-        ttk.Checkbutton(inner, text="🔁 Recurrente",
-                        variable=rec_var).grid(row=6, column=1, sticky="w", pady=(0, 10))
-
-        # ── Botones ────────────────────────────────────────────────────────────
-        def _guardar():
-            new_date   = date_var.get().strip()
-            new_cat    = cat_var.get().strip()
-            new_desc   = desc_var.get().strip()
-            new_amount = amount_var.get().strip().replace(",", ".").replace("€", "")
-
-            if not all([new_date, new_cat, new_desc, new_amount]):
-                messagebox.showerror("Error", "Rellena todos los campos.", parent=dialog)
-                return
-            try:
-                datetime.date.fromisoformat(new_date)
-            except ValueError:
-                messagebox.showerror("Error",
-                                     "Fecha inválida. Usa AAAA-MM-DD o el botón 📅.",
-                                     parent=dialog)
-                return
-            try:
-                amount_f = float(new_amount)
-            except ValueError:
-                messagebox.showerror("Error",
-                                     "Importe inválido. Usa números (ej: 12.50).",
-                                     parent=dialog)
-                return
-
-            self.dm.update_expense(expense_id, new_date, new_cat, new_desc, amount_f,
-                                   recurring=int(rec_var.get()))
-            dialog.destroy()
-            self.refresh_all()
-
-        btn_frame = tk.Frame(inner, bg=BG_CARD)
-        btn_frame.grid(row=7, column=0, columnspan=2, sticky="e", pady=(4, 0))
-
-        styled_button(btn_frame, "💾 Guardar", _guardar,
-                      color=SUCCESS, font_size=10, pady=6).pack(side="left", padx=(0, 8))
-        styled_button(btn_frame, "Cancelar", dialog.destroy,
-                      color=BG_CARD2, font_size=10, pady=6).pack(side="left")
-
-        # Centrar sobre la ventana principal con tamaño real (después de construir el contenido)
-        dialog.update_idletasks()
-        dw = dialog.winfo_reqwidth()
-        dh = dialog.winfo_reqheight()
-        px, py = self.winfo_x(), self.winfo_y()
-        pw, ph = self.winfo_width(), self.winfo_height()
-        dialog.geometry(f"+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
-        dialog.deiconify()
-
-        # wait_visibility garantiza que la ventana está mapeada antes de grab_set;
-        # sin esto grab_set lanza TclError en algunos window managers de Ubuntu.
-        dialog.wait_visibility()
-        dialog.grab_set()
-        date_entry.focus_set()
+        expense = self.dm.get_expense(int(sel[0]))
+        if expense is None:
+            return
+        EditExpenseDialog(self, self.dm, expense, self.refresh_all)
 
     def _new_category(self):
         name = simpledialog.askstring("Nueva categoría", "Nombre de la categoría:",
@@ -1600,170 +894,162 @@ class EconoHogar(tk.Tk):
         })
 
         fig = Figure(figsize=(9, 5), facecolor=BG_CARD)
-
-        if ct == "monthly_pie":
-            expenses = self.dm.expenses_for_month(ym)
-            by_cat = defaultdict(float)
-            for e in expenses:
-                by_cat[e["category"]] += e["amount"]
-            if not by_cat:
-                self._no_data(fig)
-            else:
-                ax = fig.add_subplot(111)
-                labels = list(by_cat.keys())
-                sizes  = list(by_cat.values())
-                colors = [self.dm.category_color(c) for c in labels]
-                icons  = [self.dm.category_icon(c) for c in labels]
-                label_txt = [f"{icons[i]} {labels[i]}\n{sizes[i]:,.2f}€ ({sizes[i]/sum(sizes)*100:.1f}%)"
-                             for i in range(len(labels))]
-                wedges, texts = ax.pie(
-                    sizes, labels=None, colors=colors,
-                    startangle=140, pctdistance=0.8,
-                    wedgeprops={"linewidth": 2, "edgecolor": BG_CARD})
-                ax.legend(wedges, label_txt, loc="center left",
-                          bbox_to_anchor=(1, 0, 0.5, 1),
-                          framealpha=0, fontsize=8)
-                mn = self._month_name(m)
-                ax.set_title(f"Distribución de gastos – {mn} {y}",
-                             color=TEXT_WHITE, fontsize=13, pad=16)
-
-        elif ct == "monthly_bar":
-            expenses = self.dm.expenses_for_month(ym)
-            by_cat = defaultdict(float)
-            for e in expenses:
-                by_cat[e["category"]] += e["amount"]
-            if not by_cat:
-                self._no_data(fig)
-            else:
-                ax = fig.add_subplot(111)
-                cats   = list(by_cat.keys())
-                vals   = list(by_cat.values())
-                colors = [self.dm.category_color(c) for c in cats]
-                bars = ax.bar(range(len(cats)), vals, color=colors,
-                              width=0.6, edgecolor=BG_CARD, linewidth=1.5)
-                for bar, val in zip(bars, vals):
-                    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(vals)*0.01,
-                            f"{val:,.0f}€", ha="center", va="bottom",
-                            color=TEXT_WHITE, fontsize=8)
-                icons = [self.dm.category_icon(c) for c in cats]
-                ax.set_xticks(range(len(cats)))
-                ax.set_xticklabels([f"{icons[i]}\n{cats[i]}" for i in range(len(cats))],
-                                   fontsize=8)
-                mn = self._month_name(m)
-                ax.set_title(f"Gastos por categoría – {mn} {y}",
-                             color=TEXT_WHITE, fontsize=13)
-                ax.set_ylabel("Euros (€)")
-
-        elif ct == "annual_line":
-            monthly_totals = []
-            month_labels   = []
-            for mo in range(1, 13):
-                ymo = f"{y:04d}-{mo:02d}"
-                total = sum(e["amount"] for e in self.dm.expenses_for_month(ymo))
-                monthly_totals.append(total)
-                month_labels.append(self._month_name(mo)[:3])
-            ax = fig.add_subplot(111)
-            ax.plot(range(12), monthly_totals, color=ACCENT, linewidth=2.5,
-                    marker="o", markersize=7, markerfacecolor=ACCENT2)
-            ax.fill_between(range(12), monthly_totals, alpha=0.15, color=ACCENT)
-            for xi, val in enumerate(monthly_totals):
-                if val > 0:
-                    ax.text(xi, val + max(monthly_totals or [1])*0.02,
-                            f"{val:,.0f}€", ha="center", fontsize=7, color=TEXT_MUTED)
-            salary_year = [self.dm.get_salary(f"{y:04d}-{mo:02d}") for mo in range(1, 13)]
-            if any(s > 0 for s in salary_year):
-                ax.plot(range(12), salary_year, color=SUCCESS, linewidth=1.5,
-                        linestyle="--", label="Salario")
-                ax.legend(framealpha=0)
-            ax.set_xticks(range(12))
-            ax.set_xticklabels(month_labels)
-            ax.set_title(f"Evolución de gastos – {y}", color=TEXT_WHITE, fontsize=13)
-            ax.set_ylabel("Euros (€)")
-
-        elif ct == "daily_bar":
-            expenses = self.dm.expenses_for_month(ym)
-            by_day = defaultdict(float)
-            for e in expenses:
-                day = int(e["date"].split("-")[2])
-                by_day[day] += e["amount"]
-            days = list(range(1, 32))
-            vals = [by_day.get(d, 0) for d in days]
-            colors = [ACCENT if v > 0 else BG_CARD2 for v in vals]
-            ax = fig.add_subplot(111)
-            ax.bar(days, vals, color=colors, width=0.7)
-            avg = sum(vals) / max(sum(1 for v in vals if v > 0), 1)
-            ax.axhline(avg, color=WARNING, linestyle="--", linewidth=1.2,
-                       label=f"Media: {avg:.2f}€")
-            ax.legend(framealpha=0)
-            mn = self._month_name(m)
-            ax.set_title(f"Gastos diarios – {mn} {y}", color=TEXT_WHITE, fontsize=13)
-            ax.set_xlabel("Día del mes")
-            ax.set_ylabel("Euros (€)")
-
-        elif ct == "monthly_compare":
-            # Calcular los 3 meses: M-2, M-1, M actual
-            def prev_ym(yy, mm, delta):
-                mm -= delta
-                while mm < 1:
-                    mm += 12
-                    yy -= 1
-                return yy, mm
-
-            months_data = []
-            for delta in (2, 1, 0):
-                yy, mm = prev_ym(y, m, delta)
-                ym_d = f"{yy:04d}-{mm:02d}"
-                exps = self.dm.expenses_for_month(ym_d)
-                by_cat = defaultdict(float)
-                for e in exps:
-                    by_cat[e["category"]] += e["amount"]
-                months_data.append((yy, mm, by_cat))
-
-            # Unión de categorías presentes en cualquiera de los 3 meses
-            all_cats = []
-            seen = set()
-            for _, _, by_cat in months_data:
-                for c in by_cat:
-                    if c not in seen:
-                        all_cats.append(c)
-                        seen.add(c)
-
-            if not all_cats:
-                self._no_data(fig)
-            else:
-                ax = fig.add_subplot(111)
-                n  = len(all_cats)
-                w  = 0.25          # ancho de cada barra
-                xs = range(n)
-                month_colors = ["#4A6FA5", WARNING, ACCENT]  # M-2, M-1, M actual
-
-                for i, (yy, mm, by_cat) in enumerate(months_data):
-                    vals   = [by_cat.get(c, 0) for c in all_cats]
-                    offsets = [x + (i - 1) * w for x in xs]
-                    bars = ax.bar(offsets, vals, width=w * 0.9,
-                                  color=month_colors[i], edgecolor=BG_CARD,
-                                  linewidth=1, label=f"{self._month_name(mm)[:3]} {yy}")
-                    max_val = max((v for _, _, bc in months_data for v in bc.values()), default=1)
-                    for bar, val in zip(bars, vals):
-                        if val > 0:
-                            ax.text(bar.get_x() + bar.get_width() / 2,
-                                    bar.get_height() + max_val * 0.01,
-                                    f"{val:,.0f}€", ha="center", va="bottom",
-                                    color=TEXT_WHITE, fontsize=7)
-
-                icons = [self.dm.category_icon(c) for c in all_cats]
-                ax.set_xticks(list(xs))
-                ax.set_xticklabels([f"{icons[i]}\n{all_cats[i]}" for i in range(n)], fontsize=8)
-                ax.set_ylabel("Euros (€)")
-                mn = self._month_name(m)
-                ax.set_title(f"Comparativa mensual – {mn} {y} vs meses anteriores",
-                             color=TEXT_WHITE, fontsize=13)
-                ax.legend(framealpha=0, fontsize=9)
+        dispatch = {
+            "monthly_pie":     self._chart_pie,
+            "monthly_bar":     self._chart_bar,
+            "annual_line":     self._chart_annual_line,
+            "daily_bar":       self._chart_daily_bar,
+            "monthly_compare": self._chart_monthly_compare,
+        }
+        handler = dispatch.get(ct)
+        if handler:
+            handler(fig, ym, y, m)
 
         fig.tight_layout(pad=1.5)
         canvas = FigureCanvasTkAgg(fig, master=self.chart_container)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _chart_pie(self, fig, ym, y, m):
+        expenses = self.dm.expenses_for_month(ym)
+        by_cat = defaultdict(float)
+        for e in expenses:
+            by_cat[e["category"]] += e["amount"]
+        if not by_cat:
+            self._no_data(fig)
+            return
+        ax = fig.add_subplot(111)
+        labels = list(by_cat.keys())
+        sizes  = list(by_cat.values())
+        colors = [self.dm.category_color(c) for c in labels]
+        icons  = [self.dm.category_icon(c) for c in labels]
+        label_txt = [f"{icons[i]} {labels[i]}\n{sizes[i]:,.2f}€ ({sizes[i]/sum(sizes)*100:.1f}%)"
+                     for i in range(len(labels))]
+        wedges, _ = ax.pie(
+            sizes, labels=None, colors=colors,
+            startangle=140, pctdistance=0.8,
+            wedgeprops={"linewidth": 2, "edgecolor": BG_CARD})
+        ax.legend(wedges, label_txt, loc="center left",
+                  bbox_to_anchor=(1, 0, 0.5, 1), framealpha=0, fontsize=8)
+        ax.set_title(f"Distribución de gastos – {self._month_name(m)} {y}",
+                     color=TEXT_WHITE, fontsize=13, pad=16)
+
+    def _chart_bar(self, fig, ym, y, m):
+        expenses = self.dm.expenses_for_month(ym)
+        by_cat = defaultdict(float)
+        for e in expenses:
+            by_cat[e["category"]] += e["amount"]
+        if not by_cat:
+            self._no_data(fig)
+            return
+        ax    = fig.add_subplot(111)
+        cats  = list(by_cat.keys())
+        vals  = list(by_cat.values())
+        colors = [self.dm.category_color(c) for c in cats]
+        bars = ax.bar(range(len(cats)), vals, color=colors,
+                      width=0.6, edgecolor=BG_CARD, linewidth=1.5)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(vals)*0.01,
+                    f"{val:,.0f}€", ha="center", va="bottom", color=TEXT_WHITE, fontsize=8)
+        icons = [self.dm.category_icon(c) for c in cats]
+        ax.set_xticks(range(len(cats)))
+        ax.set_xticklabels([f"{icons[i]}\n{cats[i]}" for i in range(len(cats))], fontsize=8)
+        ax.set_title(f"Gastos por categoría – {self._month_name(m)} {y}",
+                     color=TEXT_WHITE, fontsize=13)
+        ax.set_ylabel("Euros (€)")
+
+    def _chart_annual_line(self, fig, _ym, y, _m):
+        monthly_totals = []
+        month_labels   = []
+        for mo in range(1, 13):
+            total = sum(e["amount"] for e in self.dm.expenses_for_month(f"{y:04d}-{mo:02d}"))
+            monthly_totals.append(total)
+            month_labels.append(self._month_name(mo)[:3])
+        ax = fig.add_subplot(111)
+        ax.plot(range(12), monthly_totals, color=ACCENT, linewidth=2.5,
+                marker="o", markersize=7, markerfacecolor=ACCENT2)
+        ax.fill_between(range(12), monthly_totals, alpha=0.15, color=ACCENT)
+        for xi, val in enumerate(monthly_totals):
+            if val > 0:
+                ax.text(xi, val + max(monthly_totals or [1])*0.02,
+                        f"{val:,.0f}€", ha="center", fontsize=7, color=TEXT_MUTED)
+        salary_year = [self.dm.get_salary(f"{y:04d}-{mo:02d}") for mo in range(1, 13)]
+        if any(s > 0 for s in salary_year):
+            ax.plot(range(12), salary_year, color=SUCCESS, linewidth=1.5,
+                    linestyle="--", label="Salario")
+            ax.legend(framealpha=0)
+        ax.set_xticks(range(12))
+        ax.set_xticklabels(month_labels)
+        ax.set_title(f"Evolución de gastos – {y}", color=TEXT_WHITE, fontsize=13)
+        ax.set_ylabel("Euros (€)")
+
+    def _chart_daily_bar(self, fig, ym, y, m):
+        expenses = self.dm.expenses_for_month(ym)
+        by_day = defaultdict(float)
+        for e in expenses:
+            by_day[int(e["date"].split("-")[2])] += e["amount"]
+        days = list(range(1, 32))
+        vals = [by_day.get(d, 0) for d in days]
+        colors = [ACCENT if v > 0 else BG_CARD2 for v in vals]
+        ax = fig.add_subplot(111)
+        ax.bar(days, vals, color=colors, width=0.7)
+        avg = sum(vals) / max(sum(1 for v in vals if v > 0), 1)
+        ax.axhline(avg, color=WARNING, linestyle="--", linewidth=1.2,
+                   label=f"Media: {avg:.2f}€")
+        ax.legend(framealpha=0)
+        ax.set_title(f"Gastos diarios – {self._month_name(m)} {y}",
+                     color=TEXT_WHITE, fontsize=13)
+        ax.set_xlabel("Día del mes")
+        ax.set_ylabel("Euros (€)")
+
+    def _chart_monthly_compare(self, fig, _ym, y, m):
+        def prev_ym(yy, mm, delta):
+            mm -= delta
+            while mm < 1:
+                mm += 12; yy -= 1
+            return yy, mm
+
+        months_data = []
+        for delta in (2, 1, 0):
+            yy, mm = prev_ym(y, m, delta)
+            exps = self.dm.expenses_for_month(f"{yy:04d}-{mm:02d}")
+            by_cat = defaultdict(float)
+            for e in exps:
+                by_cat[e["category"]] += e["amount"]
+            months_data.append((yy, mm, by_cat))
+
+        all_cats = list(dict.fromkeys(c for _, _, bc in months_data for c in bc))
+        if not all_cats:
+            self._no_data(fig)
+            return
+
+        ax = fig.add_subplot(111)
+        n  = len(all_cats)
+        w  = 0.25
+        xs = range(n)
+        month_colors = ["#4A6FA5", WARNING, ACCENT]
+        max_val = max((v for _, _, bc in months_data for v in bc.values()), default=1)
+
+        for i, (yy, mm, by_cat) in enumerate(months_data):
+            vals    = [by_cat.get(c, 0) for c in all_cats]
+            offsets = [x + (i - 1) * w for x in xs]
+            bars = ax.bar(offsets, vals, width=w * 0.9,
+                          color=month_colors[i], edgecolor=BG_CARD,
+                          linewidth=1, label=f"{self._month_name(mm)[:3]} {yy}")
+            for bar, val in zip(bars, vals):
+                if val > 0:
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + max_val * 0.01,
+                            f"{val:,.0f}€", ha="center", va="bottom",
+                            color=TEXT_WHITE, fontsize=7)
+
+        icons = [self.dm.category_icon(c) for c in all_cats]
+        ax.set_xticks(list(xs))
+        ax.set_xticklabels([f"{icons[i]}\n{all_cats[i]}" for i in range(n)], fontsize=8)
+        ax.set_ylabel("Euros (€)")
+        ax.set_title(f"Comparativa mensual – {self._month_name(m)} {y} vs meses anteriores",
+                     color=TEXT_WHITE, fontsize=13)
+        ax.legend(framealpha=0, fontsize=9)
 
     def _no_data(self, fig):
         ax = fig.add_subplot(111)
